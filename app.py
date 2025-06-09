@@ -1,69 +1,35 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+import queue
 import json
-import time
+import os
 import logging
+import threading
+from datetime import datetime, timedelta
 import ccxt
 import pandas as pd
-from datetime import datetime, timedelta
-import sys
-import traceback
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
-from tkinter import filedialog
-import queue
-import hashlib
-import platform
-import uuid
-import webbrowser
-from urllib.parse import urlparse, parse_qs
-import requests
-import base64
-from cryptography.fernet import Fernet
+import time
 
-# 한글 인코딩 설정
-if sys.platform.startswith('win'):
-    try:
-        import io
-        if hasattr(sys.stdout, 'buffer'):
-            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    except:
-        pass
-
-# 로깅 설정
-try:
-    logging.basicConfig(
-        filename='log.txt',
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        encoding='utf-8'
-    )
-except TypeError:
-    logging.basicConfig(
-        filename='log.txt',
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
-logger = logging.getLogger()
+# 로그 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class MultiSymbolAutoTrader:
     """멀티 심볼 자동매매 엔진"""
-    
+
     def __init__(self, settings, log_queue=None):
         self.settings = settings
         self.log_queue = log_queue
         self.exchange = self.initialize_exchange()
         self.symbol_states = {}
         
-        # 자본 사용 비율에 따른 레벨 설정 계산
         self.calculate_levels()
         
         for symbol in self.settings['symbols']:
-            if symbol.strip():  # 빈 문자열이 아닌 경우만
+            if symbol.strip():
                 self.symbol_states[symbol] = {
                     'balance': 0,
                     'current_position': None,
@@ -75,12 +41,8 @@ class MultiSymbolAutoTrader:
                     'just_entered': False,
                     'tp_order_id': None,
                     'current_tp_price': None,
-                    'current_tp_type': None,  # 'profit' or 'donchian'
-                    'donchian_data': [],  # 80시간 고저 데이터
-                    'reached_target_level': False,  # 목표 차수 도달 여부
-                    'last_donchian_update': None,  # 마지막 돈치안 업데이트 시간
-                    'cached_donchian_basis': None,  # 캐시된 돈치안 베이시스
-                    'cumulative_amounts': {}  # 누적 수량 테이블
+                    'current_tp_type': None,
+                    'cumulative_amounts': {}
                 }
         
         self.set_leverages()
@@ -100,15 +62,9 @@ class MultiSymbolAutoTrader:
             '9': {'distance': 30.0, 'ratio': 30.0},
             '10': {'distance': 38.0, 'ratio': 40.0}
         }
-        
-        # 기본 총 비율 (170%)
         base_total_ratio = sum(level['ratio'] for level in base_levels.values())
-        
-        # 사용자 설정 비율
         user_ratio = self.settings.get('capital_usage_ratio', 170)
         multiplier = user_ratio / base_total_ratio
-        
-        # 계산된 레벨 설정
         self.settings['levels'] = {}
         for level, config in base_levels.items():
             self.settings['levels'][level] = {
@@ -118,7 +74,6 @@ class MultiSymbolAutoTrader:
 
     def log(self, message):
         """로그 메시지 전송"""
-        logger.info(message)
         if self.log_queue:
             self.log_queue.put(message)
         print(message)
@@ -126,17 +81,47 @@ class MultiSymbolAutoTrader:
     def initialize_exchange(self):
         """거래소 API 초기화"""
         try:
-            exchange = ccxt.okx({
-                'apiKey': self.settings['api_key'],
-                'secret': self.settings['secret_key'],
-                'password': self.settings['password'],
-                'options': {'defaultType': 'swap'},
-                'enableRateLimit': True
-            })
-
+            exchange_name = self.settings['selected_exchange'].lower()
+            api_keys = self.settings['exchanges'][exchange_name]
+            
+            if exchange_name == 'okx':
+                exchange = ccxt.okx({
+                    'apiKey': api_keys['api_key'],
+                    'secret': api_keys['secret_key'],
+                    'password': api_keys['password'],
+                    'options': {'defaultType': 'swap'},
+                    'enableRateLimit': True
+                })
+                self.check_and_set_position_mode(exchange)
+                self.log(f"{exchange_name.upper()} 거래소 API 연결 성공")
+            
+            elif exchange_name == 'binance':
+                exchange = ccxt.binance({
+                    'apiKey': api_keys['api_key'],
+                    'secret': api_keys['secret_key'],
+                    'enableRateLimit': True,
+                    'options': {'defaultType': 'future'}
+                })
+                self.log(f"{exchange_name.upper()} 거래소 API 연결 성공")
+            
+            elif exchange_name == 'bybit':
+                exchange = ccxt.bybit({
+                    'apiKey': api_keys['api_key'],
+                    'secret': api_keys['secret_key'],
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'swap',
+                        'adjustForTimeDifference': True,
+                        'recvWindow': 15000
+                    }
+                })
+                self.check_and_set_position_mode(exchange)
+                self.log(f"{exchange_name.upper()} 거래소 API 연결 성공")
+            
+            else:
+                raise ValueError(f"지원하지 않는 거래소: {exchange_name}")
+            
             exchange.load_time_difference()
-            self.check_and_set_position_mode(exchange)
-            self.log("거래소 API 연결 성공")
             return exchange
         except Exception as e:
             error_msg = f"거래소 API 연결 오류: {str(e)}"
@@ -144,31 +129,49 @@ class MultiSymbolAutoTrader:
             raise Exception(error_msg)
 
     def check_and_set_position_mode(self, exchange):
-        """포지션 모드 확인 및 설정"""
+        """포지션 모드 확인 및 설정 (OKX, Bybit에 적용)"""
         try:
-            account_config = exchange.privateGetAccountConfig()
-            
-            for config in account_config['data']:
-                if config['instType'] == 'SWAP':
-                    pos_mode = config['posMode']
-                    self.log(f"현재 포지션 모드: {pos_mode}")
-                    
-                    if pos_mode == 'net_mode':
+            if exchange.id in ['okx', 'bybit']:
+                if exchange.id == 'okx':
+                    try:
+                        account_config = exchange.privateGetAccountConfig()
+                        for config in account_config.get('data', []):
+                            if 'instType' in config and config['instType'] == 'SWAP':
+                                pos_mode = config.get('posMode', 'long_short_mode')
+                                self.log(f"현재 포지션 모드: {pos_mode}")
+                                if pos_mode != 'net_mode':
+                                    result = exchange.privatePostAccountSetPositionMode({'posMode': 'net_mode'})
+                                    if result.get('code') == '0':
+                                        self.log("단방향 모드로 변경 성공")
+                                        self.position_mode = 'net_mode'
+                                    else:
+                                        self.log(f"단방향 모드 변경 실패: {result}")
+                                        raise Exception("단방향 모드 설정 실패")
+                                else:
+                                    self.position_mode = 'net_mode'
+                                break
+                        else:
+                            self.log("SWAP instType 데이터 없음 - 단방향 모드 기본 적용")
+                            self.position_mode = 'net_mode'
+                    except Exception as e:
+                        self.log(f"포지션 모드 확인/설정 실패: {str(e)}")
+                        self.position_mode = 'net_mode'  # 기본값 적용
+                elif exchange.id == 'bybit':
+                    try:
+                        mode_response = exchange.privateGetPositionMode()
+                        mode = mode_response.get('result', {}).get('mode', 1)
+                        self.log(f"현재 포지션 모드: {mode}")
+                        if mode != 0:
+                            exchange.privatePostPositionSwitchMode({'mode': 0})
+                            self.log("단방향 모드로 변경 성공")
+                            self.position_mode = 'net_mode'
+                        else:
+                            self.position_mode = 'net_mode'
+                    except (AttributeError, KeyError, Exception) as e:
+                        self.log(f"포지션 모드 API 호출 실패 - 기본값(net_mode) 사용: {str(e)}")
                         self.position_mode = 'net_mode'
-                    else:
-                        try:
-                            result = exchange.privatePostAccountSetPositionMode({
-                                'posMode': 'net_mode'
-                            })
-                            if result['code'] == '0':
-                                self.log("단방향 모드로 변경 성공")
-                                self.position_mode = 'net_mode'
-                        except Exception as e:
-                            self.log(f"포지션 모드 변경 실패: {str(e)}")
-                    break
-                    
         except Exception as e:
-            self.log(f"포지션 모드 확인 실패: {str(e)}")
+            self.log(f"포지션 모드 확인/설정 실패: {str(e)}")
             self.position_mode = 'net_mode'
 
     def set_leverages(self):
@@ -177,16 +180,26 @@ class MultiSymbolAutoTrader:
             if symbol.strip():
                 try:
                     leverage = self.settings['leverage']
-                    self.exchange.set_leverage(leverage, symbol)
-                    self.log(f"{symbol} 레버리지 설정 완료: {leverage}x")
+                    current_leverage = self.exchange.fetch_leverage(symbol) or 1
+                    if current_leverage != leverage:
+                        self.exchange.set_leverage(leverage, symbol)
+                        self.log(f"{symbol} 레버리지 설정 완료: {leverage}x")
+                    else:
+                        self.log(f"{symbol} 레버리지 이미 {leverage}x로 설정됨")
                 except Exception as e:
                     self.log(f"{symbol} 레버리지 설정 실패: {str(e)}")
 
     def fetch_balance(self):
         """잔액 조회"""
         try:
-            balance = self.exchange.fetch_balance()
-            return balance['total']['USDT']
+            exchange_name = self.settings['selected_exchange'].lower()
+            if exchange_name == 'okx':
+                balance = self.exchange.fetch_balance(params={'type': 'swap'})['total'].get('USDT', 0)
+            elif exchange_name == 'binance':
+                balance = self.exchange.fetch_balance(params={'type': 'future'})['total'].get('USDT', 0)
+            elif exchange_name == 'bybit':
+                balance = self.exchange.fetch_balance(params={'type': 'swap'})['total'].get('USDT', 0)
+            return balance
         except Exception as e:
             self.log(f"잔액 조회 오류: {str(e)}")
             return 0
@@ -209,8 +222,15 @@ class MultiSymbolAutoTrader:
             self.log(f"{symbol} OHLCV 데이터 조회 오류: {str(e)}")
             return []
 
-    def get_price_precision(self, price):
-        """가격에 따른 적절한 소수점 자릿수 반환"""
+    def get_price_precision(self, price, symbol=None):
+        """가격과 심볼에 따른 적절한 소수점 자릿수 반환"""
+        if symbol:
+            try:
+                market = self.exchange.market(symbol)
+                precision = market.get('precision', {}).get('price', 8)
+                return precision
+            except Exception:
+                pass
         if price >= 1000:
             return 2
         elif price >= 100:
@@ -226,61 +246,37 @@ class MultiSymbolAutoTrader:
         else:
             return 8
 
-    def format_price(self, price):
-        """가격을 적절한 소수점으로 포맷팅"""
-        precision = self.get_price_precision(price)
+    def format_price(self, price, symbol=None):
+        """가격을 심볼에 맞는 소수점으로 포맷팅"""
+        precision = self.get_price_precision(price, symbol)
         return f"${price:.{precision}f}"
-
-    def calculate_donchian_basis(self, symbol):
-        """돈치안 밴드 베이시스 계산 (80시간 고저 평균) - 캐싱 적용"""
-        try:
-            state = self.symbol_states[symbol]
-            current_time = datetime.now()
-            
-            # 캐시된 데이터가 있고 1시간이 지나지 않았으면 캐시 사용
-            if (state['last_donchian_update'] and 
-                state['cached_donchian_basis'] and
-                current_time - state['last_donchian_update'] < timedelta(hours=1)):
-                return state['cached_donchian_basis']
-            
-            ohlcv_data = self.fetch_ohlcv(symbol, '1h', 80)
-            if len(ohlcv_data) < 80:
-                return None
-            
-            # [timestamp, open, high, low, close, volume] 형태
-            highs = [candle[2] for candle in ohlcv_data]  # high
-            lows = [candle[3] for candle in ohlcv_data]   # low
-            
-            highest = max(highs)
-            lowest = min(lows)
-            basis = (highest + lowest) / 2
-            
-            # 캐시 업데이트
-            state['last_donchian_update'] = current_time
-            state['cached_donchian_basis'] = basis
-            
-            # 로그는 간단하게만
-            self.log(f"{symbol} 손절 기준가 업데이트: {self.format_price(basis)}")
-            return basis
-            
-        except Exception as e:
-            self.log(f"{symbol} 돈치안 베이시스 계산 오류: {str(e)}")
-            return None
 
     def fetch_current_position(self, symbol):
         """포지션 조회"""
         try:
-            positions = self.exchange.fetch_positions([symbol])
-            for position in positions:
-                if position['symbol'] == symbol and float(position['contracts']) > 0:
-                    return {
-                        'side': position['side'],
-                        'amount': float(position['contracts']),
-                        'entry_price': float(position['entryPrice']),
-                        'leverage': float(position['leverage']),
-                        'unrealized_pnl': float(position['unrealizedPnl'])
-                    }
-            return None
+            for attempt in range(5):
+                try:
+                    positions = self.exchange.fetch_positions([symbol])
+                    for position in positions:
+                        if position['symbol'] == symbol:
+                            contracts = float(position.get('contracts', 0)) if position.get('contracts') is not None else 0
+                            entry_price = float(position.get('entryPrice', 0)) if position.get('entryPrice') is not None else 0
+                            if contracts > 0:
+                                return {
+                                    'side': position.get('side', 'long'),
+                                    'amount': contracts,
+                                    'entry_price': entry_price,
+                                    'leverage': float(position.get('leverage', 1)),
+                                    'unrealized_pnl': float(position.get('unrealizedPnl', 0))
+                                }
+                    return None
+                except Exception as e:
+                    self.log(f"{symbol} 포지션 조회 시도 {attempt + 1}/5 실패: {str(e)}")
+                    if attempt < 4:
+                        time.sleep(2)
+                    else:
+                        self.log(f"{symbol} 포지션 조회 오류: {str(e)}")
+                        return None
         except Exception as e:
             self.log(f"{symbol} 포지션 조회 오류: {str(e)}")
             return None
@@ -299,14 +295,12 @@ class MultiSymbolAutoTrader:
             open_orders = self.fetch_open_orders(symbol)
             if not open_orders:
                 return
-                
             for order in open_orders:
                 try:
                     self.exchange.cancel_order(order['id'], symbol)
                     self.log(f"{symbol} 주문 취소: ID {order['id']}")
                 except Exception as e:
-                    self.log(f"{symbol} 주문 취소 실패: ID {order['id']}")
-            
+                    self.log(f"{symbol} 주문 취소 실패: ID {order['id']}, 오류: {str(e)}")
             self.log(f"{symbol} 총 {len(open_orders)}개 주문 취소 완료")
         except Exception as e:
             self.log(f"{symbol} 주문 취소 오류: {str(e)}")
@@ -324,21 +318,20 @@ class MultiSymbolAutoTrader:
                     state['current_tp_type'] = None
                 except Exception as e:
                     self.log(f"{symbol} TP 주문 취소 실패: {str(e)}")
-                    
         except Exception as e:
             self.log(f"{symbol} TP 주문 취소 오류: {str(e)}")
 
     def calculate_order_amount(self, level, price, total_balance, symbol):
         """주문 수량 계산"""
-        level_str = str(level)
-        base_ratio = self.settings['levels'][level_str]['ratio'] / 100.0
-        active_symbols_count = len([s for s in self.settings['symbols'] if s.strip()])
-        symbol_ratio = base_ratio / active_symbols_count
-        capital_multiplier = self.settings.get('capital_usage_ratio', 170) / 170.0
-        final_ratio = symbol_ratio * capital_multiplier
-        position_value = total_balance * final_ratio
-        
         try:
+            level_str = str(level)
+            base_ratio = self.settings['levels'][level_str]['ratio'] / 100.0
+            active_symbols_count = len([s for s in self.settings['symbols'] if s.strip()])
+            symbol_ratio = base_ratio / active_symbols_count
+            capital_multiplier = self.settings.get('capital_usage_ratio', 170) / 170.0
+            final_ratio = symbol_ratio * capital_multiplier
+            position_value = total_balance * final_ratio
+            
             market = self.exchange.market(symbol)
             contract_size = market.get('contractSize', 1)
             contracts = position_value / (price * contract_size)
@@ -361,26 +354,53 @@ class MultiSymbolAutoTrader:
                 contracts = min_amount
             
             return contracts
-                
         except Exception as e:
             self.log(f"{symbol} 주문 수량 계산 오류: {str(e)}")
             contracts = position_value / price
             return max(float(round(contracts, 8)), 0.001)
 
+
     def place_market_order(self, symbol, side, amount):
         """시장가 주문"""
         try:
             params = {}
-            if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
+            exchange_name = self.settings['selected_exchange'].lower()
+            if exchange_name == 'binance':
+                # markets 데이터 로드
+                markets = self.exchange.load_markets()
+                if symbol in markets:
+                    market = markets[symbol]
+                    precision = market['precision']['amount']  # 소수점 정밀도
+                    lot_size = float(market['limits']['amount']['min'])  # 최소 주문 수량
+                else:
+                    precision = 8  # 기본 정밀도
+                    lot_size = 0.01  # 기본 최소 주문 수량
+                ticker = self.exchange.fetch_ticker(symbol)
+                current_price = ticker['last']
+                min_notional = 5.0
+                required_amount = max(amount, (min_notional / current_price) * 1.1)
+                # 정밀도에 맞게 반올림
+                rounded_amount = round(required_amount, precision)
+                # lot_size 배수로 조정, 정수화
+                multiplier = int(round(rounded_amount / lot_size))
+                adjusted_amount = int(multiplier * lot_size)  # 명시적 정수 변환
+                if adjusted_amount < int(lot_size):
+                    adjusted_amount = int(lot_size)
+                self.log(f"Debug - Symbol: {symbol}, Required: {required_amount}, Rounded: {rounded_amount}, Adjusted: {adjusted_amount}, Lot Size: {lot_size}")
+            elif exchange_name == 'bybit':
                 if side == 'buy':
                     params['posSide'] = 'long'
                 elif side == 'sell':
                     params['posSide'] = 'short'
+            elif exchange_name == 'okx':
+                params['tdMode'] = 'cross'
+                if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
+                    params['posSide'] = 'long' if side == 'buy' else 'short'
             
-            order = self.exchange.create_market_order(symbol, side, amount, params=params)
-            self.log(f"{symbol} {side} 시장가 주문 성공: 계약수 {amount}")
+            order = self.exchange.create_market_order(symbol, side, adjusted_amount, params=params)
+            self.log(f"{symbol} {side} 시장가 주문 성공: 계약수 {adjusted_amount}")
+            self.generate_followup_orders(symbol, side, adjusted_amount)  # 후속 주문 트리거
             return order
-            
         except Exception as e:
             self.log(f"{symbol} 시장가 주문 오류: {str(e)}")
             return None
@@ -389,25 +409,66 @@ class MultiSymbolAutoTrader:
         """지정가 주문"""
         try:
             params = {}
-            if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
+            exchange_name = self.settings['selected_exchange'].lower()
+            if exchange_name == 'binance':
+                params['reduceOnly'] = False
+            elif exchange_name == 'bybit':
                 if side == 'buy':
                     params['posSide'] = 'long'
                 elif side == 'sell':
                     params['posSide'] = 'short'
+            elif exchange_name == 'okx':
+                params['tdMode'] = 'cross'
+                if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
+                    params['posSide'] = 'long' if side == 'buy' else 'short'
             
             order = self.exchange.create_limit_order(symbol, side, amount, price, params=params)
-            self.log(f"{symbol} {level}회차 {side} 지정가 주문 실행: 가격 {price}, 수량 {amount}")
+            self.log(f"{symbol} {level}회차 {side} 지정가 주문 실행: 가격 {self.format_price(price)}, 수량 {amount}")
             return order
         except Exception as e:
             self.log(f"{symbol} 지정가 주문 오류: {str(e)}")
             return None
 
+    def generate_followup_orders(self, symbol, side, initial_amount):
+        """시장가 주문 후 후속 지정가 주문 생성 (기존 로직 기반)"""
+        try:
+            exchange_name = self.settings['selected_exchange'].lower()
+            if exchange_name == 'binance':
+                position = self.exchange.fetch_position(symbol)
+                if position and float(position['info']['positionAmt']) != 0:
+                    base_price = float(self.exchange.fetch_ticker(symbol)['last'])
+                    for i in range(1, 6):  # 5회차 후속 주문
+                        price_step = base_price * (1 + 0.01 * i)  # 1%씩 증가
+                        amount_step = initial_amount * 0.2  # 20%씩 분할
+                        self.place_limit_order(symbol, "sell" if side == "buy" else "buy", price_step, amount_step, i)
+                else:
+                    self.log(f"{symbol} 포지션 없음, 후속 주문 생성 실패")
+            elif exchange_name in ['bybit', 'okx']:
+                # 기존 OKX 로직 유지 (포지션 기반 후속 주문)
+                state = self.symbol_states.get(symbol, {})
+                if state.get('position_amount', 0) > 0:
+                    base_price = float(self.exchange.fetch_ticker(symbol)['last'])
+                    for i in range(1, 6):
+                        price_step = base_price * (1 + 0.01 * i)
+                        amount_step = initial_amount * 0.2
+                        self.place_limit_order(symbol, "sell" if side == "buy" else "buy", price_step, amount_step, i)
+        except Exception as e:
+            self.log(f"{symbol} 후속 주문 생성 오류: {str(e)}")
+
     def place_tp_order(self, symbol, tp_price, amount, tp_type):
         """TP 주문 생성 - 에러 처리 강화"""
         try:
-            params = {"reduceOnly": True}
-            if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
-                params['posSide'] = 'long'
+            params = {'reduceOnly': True}
+            exchange_name = self.settings['selected_exchange'].lower()
+            if exchange_name == 'okx':
+                params['tdMode'] = 'cross'  # OKX 크로스 마진 모드 설정
+                # 단방향 모드에서는 posSide 생략, 양방향 모드에서만 설정
+                if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
+                    params['posSide'] = 'long'  # TP는 long 포지션 청산
+            elif exchange_name == 'bybit':
+                params['posSide'] = 'long'  # TP는 long 포지션 청산
+            elif exchange_name == 'binance':
+                params['reduceOnly'] = True
             
             order = self.exchange.create_limit_order(symbol, "sell", amount, tp_price, params=params)
             
@@ -423,158 +484,95 @@ class MultiSymbolAutoTrader:
             else:
                 self.log(f"{symbol} TP 주문 생성 실패 - 주문 정보 없음")
                 return None
-                
         except Exception as e:
             self.log(f"{symbol} TP 주문 생성 오류: {str(e)}")
             return None
 
     def check_tp_execution(self, symbol, position):
-        """TP 주문 체결 확인 - 개선된 버전"""
+        """TP 주문 체결 확인"""
         try:
             state = self.symbol_states[symbol]
-            
-            # TP 주문이 있는 경우에만 확인
             if not state.get('tp_order_id'):
                 return False
-            
             try:
-                # TP 주문 상태 확인
-                tp_order = self.exchange.fetch_order(state['tp_order_id'], symbol)
-                
-                # 주문이 체결된 경우
-                if tp_order['status'] in ['closed', 'filled']:
+                tp_order = self.exchange.fetch_open_order(state['tp_order_id'], symbol, params={"acknowledged": True})
+                if tp_order and tp_order['status'] in ['closed', 'filled']:
                     tp_type_korean = "익절" if state.get('current_tp_type') == "profit" else "손절"
                     self.log(f"{symbol} {tp_type_korean} TP 주문 체결 감지 - 포지션 정리 시작")
-                    
-                    # 상태 초기화
                     self.reset_symbol_state_after_close(symbol)
                     return True
-                    
             except Exception as order_error:
-                # 주문 조회 실패 시 - 주문이 이미 체결되어 삭제되었을 가능성
                 self.log(f"{symbol} TP 주문 조회 실패: {str(order_error)}")
-                
-                # 포지션이 없다면 TP가 체결되었을 가능성이 높음
                 if not position:
                     self.log(f"{symbol} 포지션 없음 + TP 주문 조회 실패 = TP 체결로 판단")
                     self.reset_symbol_state_after_close(symbol)
                     return True
-            
             return False
-            
         except Exception as e:
             self.log(f"{symbol} TP 체결 확인 오류: {str(e)}")
             return False
 
     def reset_symbol_state_after_close(self, symbol):
-        """포지션 청산 후 상태 초기화 - 주문 취소 추가"""
+        """포지션 청산 후 상태 초기화"""
         try:
             state = self.symbol_states[symbol]
-            
-            # 핵심 수정: 모든 미체결 주문 취소
             self.log(f"{symbol} 청산 완료 - 모든 미체결 주문 취소 시작")
             self.cancel_all_orders(symbol)
-            time.sleep(1)  # 주문 취소 완료 대기
-            
-            # 청산 시간 기록
+            time.sleep(1)
             state['last_close_time'] = datetime.now()
-            
-            # 상태 초기화
             state['is_first_entry'] = False
             state['order_level'] = 0
             state['just_entered'] = False
             state['tp_order_id'] = None
             state['current_tp_price'] = None
             state['current_tp_type'] = None
-            state['reached_target_level'] = False
-            
-            # 캐시 및 테이블 초기화
-            state['last_donchian_update'] = None
-            state['cached_donchian_basis'] = None
             state['cumulative_amounts'] = {}
-            
             self.log(f"{symbol} 상태 초기화 완료 - 60초 후 재진입 가능")
-            
         except Exception as e:
             self.log(f"{symbol} 상태 초기화 오류: {str(e)}")
 
     def check_position_status_change(self, symbol, prev_position, current_position):
-        """포지션 상태 변화 감지 및 처리 - 주문 취소 강화"""
+        """포지션 상태 변화 감지 및 처리"""
         try:
             state = self.symbol_states[symbol]
-            
-            # 포지션이 있었는데 없어진 경우 (청산됨)
             if prev_position and not current_position:
-                # TP 주문이 있었다면 체결된 것으로 판단
                 if state.get('tp_order_id'):
                     tp_type_korean = "익절" if state.get('current_tp_type') == "profit" else "손절"
                     self.log(f"{symbol} 포지션 청산 감지 - {tp_type_korean} 완료")
                 else:
                     self.log(f"{symbol} 포지션 청산 감지 - 수동 청산으로 추정")
-                
-                # 핵심: 즉시 모든 주문 취소 후 상태 초기화
                 self.log(f"{symbol} 청산 감지 즉시 - 모든 주문 취소 실행")
                 self.cancel_all_orders(symbol)
                 time.sleep(0.5)
-                
-                # 상태 초기화
                 self.reset_symbol_state_after_close(symbol)
                 return True
-                
             return False
-            
         except Exception as e:
             self.log(f"{symbol} 포지션 상태 변화 확인 오류: {str(e)}")
             return False
 
     def update_tp_order(self, symbol, position):
-        """TP 주문 업데이트 - 안정성 개선"""
+        """TP 주문 업데이트"""
         try:
             if not position or position['side'] != 'long':
                 return
-            
             state = self.symbol_states[symbol]
-            
-            # 익절가 계산
-            take_profit_percent = self.settings['take_profit_percent'] / 100.0
-            profit_price = position['entry_price'] * (1 + take_profit_percent)
-            
-            # 손절 기준가 계산 (목표 차수 도달 시만, 1시간마다만 업데이트)
-            donchian_price = None
-            if state['reached_target_level']:
-                donchian_price = self.calculate_donchian_basis(symbol)
-            
-            # 더 가까운(낮은) 가격을 TP로 설정
-            if donchian_price and donchian_price < profit_price:
-                target_tp_price = donchian_price
-                target_tp_type = "stop_loss"
-            else:
-                target_tp_price = profit_price
-                target_tp_type = "profit"
-            
-            # 현재 TP와 비교하여 업데이트 필요성 확인
+            take_profit_percent = self.settings.get('take_profit_percent', 1.0) / 100.0
+            target_tp_price = position['entry_price'] * (1 + take_profit_percent)
+            target_tp_type = "profit"
             current_tp = state.get('current_tp_price')
             current_type = state.get('current_tp_type')
-            
-            # TP 가격이나 타입이 변경된 경우에만 업데이트
             price_changed = not current_tp or abs(current_tp - target_tp_price) > 0.01
             type_changed = current_type != target_tp_type
-            
             if price_changed or type_changed:
-                # 기존 TP 주문 취소
                 if state['tp_order_id']:
                     self.cancel_tp_order(symbol)
                     time.sleep(0.5)
-                
-                # 새 TP 주문 생성
                 tp_order = self.place_tp_order(symbol, target_tp_price, position['amount'], target_tp_type)
-                
                 if tp_order:
-                    tp_type_korean = "익절" if target_tp_type == "profit" else "손절"
-                    self.log(f"{symbol} TP 업데이트 완료: {tp_type_korean} {self.format_price(target_tp_price)}")
+                    self.log(f"{symbol} TP 업데이트 완료: 익절 {self.format_price(target_tp_price)}")
                 else:
                     self.log(f"{symbol} TP 주문 생성 실패")
-            
         except Exception as e:
             self.log(f"{symbol} TP 업데이트 오류: {str(e)}")
 
@@ -583,19 +581,16 @@ class MultiSymbolAutoTrader:
         position = self.fetch_current_position(symbol)
         if position and position['side'] == 'long':
             try:
-                params = {"reduceOnly": True}
-                if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
+                params = {'posSide': 'long', "reduceOnly": True}
+                exchange_name = self.settings['selected_exchange'].lower()
+                if exchange_name == 'okx':
+                    params.update({'tdMode': 'cross'})  # 크로스 마진 모드 설정
+                if exchange_name in ['okx', 'bybit']:
                     params['posSide'] = 'long'
-                
                 close_order = self.exchange.create_market_order(symbol, "sell", position["amount"], params=params)
                 self.log(f"{symbol} 롱 포지션 시장가 청산: {position['amount']}")
-                
                 self.symbol_states[symbol]['last_close_time'] = datetime.now()
                 self.symbol_states[symbol]['is_first_entry'] = False
-                self.symbol_states[symbol]['reached_target_level'] = False
-                # 돈치안 캐시와 누적 수량 테이블도 초기화
-                self.symbol_states[symbol]['last_donchian_update'] = None
-                self.symbol_states[symbol]['cached_donchian_basis'] = None
                 self.symbol_states[symbol]['cumulative_amounts'] = {}
                 return close_order
             except Exception as e:
@@ -612,7 +607,7 @@ class MultiSymbolAutoTrader:
                     position = self.fetch_current_position(symbol)
                     if position:
                         self.close_position_market(symbol)
-                        time.sleep(1)  # 주문 간격
+                        time.sleep(1)
                 except Exception as e:
                     self.log(f"{symbol} 포지션 청산 오류: {str(e)}")
 
@@ -621,7 +616,6 @@ class MultiSymbolAutoTrader:
         level = 1
         long_amount = self.calculate_order_amount(level, current_price, total_balance, symbol)
         long_order = self.place_market_order(symbol, "buy", long_amount)
-        
         if long_order:
             self.log(f"{symbol} 1회차 롱 시장가 주문 생성 완료 - 수량: {long_amount}")
             return True
@@ -630,7 +624,6 @@ class MultiSymbolAutoTrader:
     def place_all_next_level_orders(self, symbol, entry_price, total_balance):
         """후속 회차 주문 생성"""
         self.log(f"{symbol} 롱 포지션 진입 후 모든 후속 회차 주문 생성 시작")
-        
         max_level = 10 if '10' in self.settings['levels'] else 9
         for level in range(2, max_level + 1):
             level_str = str(level)
@@ -639,10 +632,8 @@ class MultiSymbolAutoTrader:
                 next_price = entry_price * (1 - distance)
                 amount = self.calculate_order_amount(level, next_price, total_balance, symbol)
                 order = self.place_limit_order(symbol, "buy", next_price, amount, level)
-                
                 if order:
-                    self.log(f"{symbol} {level}회차 롱 주문 생성 완료 - 가격: {next_price}")
-        
+                    self.log(f"{symbol} {level}회차 롱 주문 생성 완료 - 가격: {self.format_price(next_price)}, 수량: {amount}")
         self.symbol_states[symbol]['order_level'] = max_level
         self.log(f"{symbol} 모든 후속 회차 주문 생성 완료")
 
@@ -652,18 +643,14 @@ class MultiSymbolAutoTrader:
             state = self.symbol_states[symbol]
             cumulative_amounts = {}
             cumulative_total = 0
-            
-            # 1~10차까지 누적 수량 계산
             for level in range(1, 11):
                 level_str = str(level)
                 if level_str in self.settings['levels']:
                     amount = self.calculate_order_amount(level, entry_price, total_balance, symbol)
                     cumulative_total += amount
                     cumulative_amounts[level] = cumulative_total
-            
             state['cumulative_amounts'] = cumulative_amounts
             self.log(f"{symbol} 누적 수량 테이블 생성 완료")
-            
         except Exception as e:
             self.log(f"{symbol} 누적 수량 테이블 생성 오류: {str(e)}")
 
@@ -672,156 +659,91 @@ class MultiSymbolAutoTrader:
         try:
             state = self.symbol_states[symbol]
             cumulative_amounts = state.get('cumulative_amounts', {})
-            
             if not cumulative_amounts:
-                return 1  # 누적 테이블이 없으면 1차로 가정
-            
-            # 현재 포지션 수량과 가장 가까운 누적 수량 찾기
+                return 1
             closest_level = 1
             min_diff = float('inf')
-            
             for level, cumulative_amount in cumulative_amounts.items():
                 diff = abs(position_amount - cumulative_amount)
                 if diff < min_diff:
                     min_diff = diff
                     closest_level = level
-            
             return closest_level
-            
         except Exception as e:
             self.log(f"{symbol} 현재 차수 계산 오류: {str(e)}")
             return 1
 
-    def check_level_progress(self, symbol, position, open_orders):
-        """진입 차수 진행 상황 확인 - 누적 수량 기준"""
-        try:
-            state = self.symbol_states[symbol]
-            target_level = self.settings.get('donchian_activation_level', 6)
-            
-            if not position:
-                return
-            
-            # 누적 수량 테이블이 없으면 생성
-            if not state.get('cumulative_amounts'):
-                total_balance = self.fetch_balance()
-                self.calculate_cumulative_amounts(symbol, position['entry_price'], total_balance)
-            
-            # 현재 포지션 수량을 기준으로 진입 차수 계산
-            current_level = self.get_current_level_from_position(symbol, position['amount'])
-            
-            # 목표 차수 이상에 도달했는지 확인
-            if current_level >= target_level and not state['reached_target_level']:
-                state['reached_target_level'] = True
-                self.log(f"{symbol} {current_level}차 진입 감지 - 손절허용 레벨 활성화")
-                
-        except Exception as e:
-            self.log(f"{symbol} 레벨 진행 확인 오류: {str(e)}")
-
     def can_enter_position(self, symbol):
         """포지션 진입 가능 여부 확인"""
         state = self.symbol_states[symbol]
-        
         if state['is_first_entry']:
             return True
-        
         if state['last_close_time']:
             elapsed = datetime.now() - state['last_close_time']
-            wait_time = timedelta(seconds=60)  # 고정 60초
+            wait_time = timedelta(seconds=60)
             return elapsed >= wait_time
-        
         return True
 
     def process_symbol(self, symbol, total_balance):
-        """개별 종목 처리 - 주문 취소 로직 강화"""
+        """개별 종목 처리"""
         try:
             if not self.symbol_states[symbol]['is_active']:
                 return
-            
             current_price = self.fetch_ticker(symbol)
             position = self.fetch_current_position(symbol)
             open_orders = self.fetch_open_orders(symbol)
-            
             state = self.symbol_states[symbol]
             prev_position = state['current_position']
-            
-            # 추가: 포지션이 없는데 주문이 있는 경우 모두 취소
             if not position and open_orders:
                 self.log(f"{symbol} 포지션 없음 + 미체결 주문 {len(open_orders)}개 감지 - 모든 주문 취소")
                 self.cancel_all_orders(symbol)
                 time.sleep(1)
-                open_orders = []  # 주문 목록 초기화
-            
-            # 포지션 상태 변화 먼저 확인
+                open_orders = []
             if self.check_position_status_change(symbol, prev_position, position):
-                # 포지션이 청산된 경우 더 이상 처리하지 않음
                 state['current_position'] = position
-                state['current_orders'] = []  # 주문 목록 초기화
+                state['current_orders'] = []
                 return
-            
-            # 포지션이 있는 경우 TP 체결 확인
             if position and position['side'] == 'long':
                 if self.check_tp_execution(symbol, position):
-                    # TP가 체결된 경우 더 이상 처리하지 않음
                     state['current_position'] = None
                     state['current_orders'] = []
                     return
-            
-            # 포지션 변경 감지 (새로 진입한 경우)
-            if not prev_position and position and position['side'] == 'long' and not state.get('just_entered', False):
-                self.log(f"{symbol} 새 롱 포지션 감지: {position['amount']} @ {position['entry_price']}")
-                
-                if open_orders:
-                    self.cancel_all_orders(symbol)
-                    time.sleep(1)
-                
-                self.place_all_next_level_orders(symbol, position['entry_price'], total_balance)
-                state['just_entered'] = True
-                
-                # 누적 수량 테이블 생성
-                self.calculate_cumulative_amounts(symbol, position['entry_price'], total_balance)
-                
-                # 초기 TP 설정
-                self.update_tp_order(symbol, position)
-            
-            # 포지션이 없는 경우
-            elif not position:
+            if not position:
                 state['just_entered'] = False
-                
-                # 중요: 주문이 없고 진입 가능한 경우에만 진입
                 if not open_orders and self.can_enter_position(symbol):
-                    self.log(f"{symbol} 포지션 없음, 초기 롱 시장가 진입")
+                    self.log(f"{symbol} 진입 조건 충족 - 롱 진입 시도")
                     if self.place_initial_long_order(symbol, current_price, total_balance):
                         state['order_level'] = 1
                         state['just_entered'] = True
                         time.sleep(3)
-                        new_position = self.fetch_current_position(symbol)
-                        if new_position and new_position['side'] == 'long':
-                            self.log(f"{symbol} 시장가 진입 확인됨, 후속 주문 생성")
-                            self.place_all_next_level_orders(symbol, new_position['entry_price'], total_balance)
-                            # 누적 수량 테이블 생성
-                            self.calculate_cumulative_amounts(symbol, new_position['entry_price'], total_balance)
-                            # TP 설정
-                            self.update_tp_order(symbol, new_position)
+                        for _ in range(3):
+                            new_position = self.fetch_current_position(symbol)
+                            if new_position and new_position['side'] == 'long':
+                                self.log(f"{symbol} 시장가 진입 확인됨, 후속 주문 생성")
+                                self.place_all_next_level_orders(symbol, new_position['entry_price'], total_balance)
+                                self.calculate_cumulative_amounts(symbol, new_position['entry_price'], total_balance)
+                                self.update_tp_order(symbol, new_position)
+                                break
+                            time.sleep(1)
                 elif open_orders:
-                    # 진입 대기 중이면서 주문이 있는 경우
                     if self.can_enter_position(symbol):
                         self.log(f"{symbol} 진입 대기시간 완료 - 기존 주문 유지")
                     else:
                         remaining_time = 60 - (datetime.now() - state['last_close_time']).total_seconds()
                         self.log(f"{symbol} 재진입 대기 중 - {remaining_time:.0f}초 남음")
-            
-            # 포지션이 있는 경우 추가 처리
             elif position and position['side'] == 'long':
-                # 레벨 진행 상황 확인
-                self.check_level_progress(symbol, position, open_orders)
-                
-                # TP 주문 업데이트 (조건 변경 시)
+                if not state.get('just_entered', False):
+                    self.log(f"{symbol} 새 롱 포지션 감지: {position['amount']} @ {position['entry_price']}")
+                    if open_orders:
+                        self.cancel_all_orders(symbol)
+                        time.sleep(1)
+                    self.place_all_next_level_orders(symbol, position['entry_price'], total_balance)
+                    state['just_entered'] = True
+                    self.calculate_cumulative_amounts(symbol, position['entry_price'], total_balance)
+                    self.update_tp_order(symbol, position)
                 self.update_tp_order(symbol, position)
-            
-            # 상태 업데이트
             state['current_position'] = position
             state['current_orders'] = open_orders
-            
         except Exception as e:
             self.log(f"{symbol} 처리 오류: {str(e)}")
 
@@ -829,76 +751,52 @@ class MultiSymbolAutoTrader:
         """현재 상태 출력"""
         status_msg = "\n===== 현재 상태 ====="
         self.log(status_msg)
-        
         for symbol in self.settings['symbols']:
             if not symbol.strip():
                 continue
-                
             try:
                 current_price = self.fetch_ticker(symbol)
                 position = self.fetch_current_position(symbol)
                 open_orders = self.fetch_open_orders(symbol)
                 state = self.symbol_states[symbol]
-                
                 self.log(f"\n--- {symbol} ---")
                 self.log(f"현재가: {self.format_price(current_price)}")
                 self.log(f"활성화: {'예' if state['is_active'] else '아니오'}")
-                
                 if position:
                     self.log(f"포지션: {position['side']} {position['amount']:.6f}")
                     self.log(f"진입가: {self.format_price(position['entry_price'])}")
                     self.log(f"미실현 손익: ${position['unrealized_pnl']:.2f}")
-                    
-                    # TP 정보 표시
                     if state['current_tp_price']:
-                        tp_type_korean = "익절" if state['current_tp_type'] == "profit" else "손절"
-                        self.log(f"활성 TP: {tp_type_korean} {self.format_price(state['current_tp_price'])}")
-                    
-                    # 손절허용 레벨 활성화 상태
-                    target_level = self.settings.get('donchian_activation_level', 6)
-                    if state['reached_target_level']:
-                        self.log(f"손절허용 레벨: 활성화됨 ({target_level}차 이상 진입)")
-                    else:
-                        self.log(f"손절허용 레벨: 비활성화 ({target_level}차 미도달)")
-                        
+                        self.log(f"활성 TP: 익절 {self.format_price(state['current_tp_price'])}")
                 else:
                     self.log("포지션: 없음")
-                
                 self.log(f"미체결 주문: {len(open_orders)}개")
                 if state['last_close_time']:
                     elapsed = datetime.now() - state['last_close_time']
                     wait_time = timedelta(seconds=60)
                     remaining = max(0, (wait_time - elapsed).total_seconds())
                     self.log(f"진입 대기시간: {remaining:.0f}초 남음")
-                
             except Exception as e:
                 self.log(f"{symbol} 상태 조회 오류: {str(e)}")
-        
-        # 계좌 정보
         try:
             total_balance = self.fetch_balance()
             self.log(f"\n총 잔액: ${total_balance:.2f} USDT")
         except Exception as e:
             self.log(f"잔액 조회 오류: {str(e)}")
-        
         self.log("=" * 50)
 
     def run(self):
         """메인 실행 루프"""
         self.log("자동매매 시작")
-        
         while not self.should_stop:
             try:
                 total_balance = self.fetch_balance()
-                
                 for symbol in self.settings['symbols']:
                     if self.should_stop:
                         break
                     if symbol.strip():
                         self.process_symbol(symbol, total_balance)
                         time.sleep(1)
-                
-                # 상태 출력 (10분마다)
                 if hasattr(self, 'last_status_time'):
                     if datetime.now() - self.last_status_time > timedelta(minutes=10):
                         self.show_status()
@@ -906,13 +804,10 @@ class MultiSymbolAutoTrader:
                 else:
                     self.show_status()
                     self.last_status_time = datetime.now()
-                
-                time.sleep(30)  # 고정 30초 간격
-                
+                time.sleep(30)
             except Exception as e:
                 self.log(f"메인 루프 오류: {str(e)}")
                 time.sleep(10)
-        
         self.log("자동매매 종료")
 
     def stop(self):
@@ -923,8 +818,6 @@ class MultiSymbolAutoTrader:
     def emergency_stop(self):
         """긴급 정지 - 모든 주문 취소 및 포지션 청산"""
         self.log("긴급 정지 시작 - 모든 주문 취소 및 포지션 청산")
-        
-        # 모든 주문 취소
         for symbol in self.settings['symbols']:
             if symbol.strip():
                 try:
@@ -932,10 +825,9 @@ class MultiSymbolAutoTrader:
                     time.sleep(0.5)
                 except Exception as e:
                     self.log(f"{symbol} 긴급 주문 취소 오류: {str(e)}")
-        
-        # 모든 포지션 청산
         self.close_all_positions()
         self.stop()
+
 
 class TradingGUI:
     """기본형 GUI 인터페이스"""
@@ -944,6 +836,11 @@ class TradingGUI:
         self.trader = None
         self.trading_thread = None
         self.log_queue = queue.Queue()
+        self.api_keys = {  # GUI에서 관리할 API 키 캐시
+            'okx': {'api_key': '', 'secret_key': '', 'password': ''},
+            'binance': {'api_key': '', 'secret_key': '', 'password': ''},
+            'bybit': {'api_key': '', 'secret_key': '', 'password': ''}
+        }
         
         self.root = tk.Tk()
         self.root.title("Crypto Futures Trading Bot")
@@ -1008,7 +905,7 @@ class TradingGUI:
         self.notebook.add(api_frame, text="API 설정")
         
         ttk.Label(api_frame, text="거래소 선택:").grid(row=0, column=0, sticky='w', padx=5, pady=5)
-        self.exchange_var = tk.StringVar(value='OKX')
+        self.exchange_var = tk.StringVar(value='Bybit')
         exchange_dropdown = ttk.Combobox(
             api_frame,
             textvariable=self.exchange_var,
@@ -1033,9 +930,28 @@ class TradingGUI:
 
     def on_exchange_select(self, event):
         """드롭다운 선택 시 호출되는 콜백"""
-        selected_exchange = self.exchange_var.get()
+        selected_exchange = self.exchange_var.get().lower()
         self.log_text.insert(tk.END, f"[INFO] 거래소 선택됨: {selected_exchange}\n")
         self.log_text.see(tk.END)
+        # 저장된 API 키로 GUI 업데이트
+        api_keys = self.api_keys.get(selected_exchange, {'api_key': '', 'secret_key': '', 'password': ''})
+        self.api_key_entry.delete(0, tk.END)
+        self.api_key_entry.insert(0, api_keys['api_key'])
+        self.secret_key_entry.delete(0, tk.END)
+        self.secret_key_entry.insert(0, api_keys['secret_key'])
+        self.password_entry.delete(0, tk.END)
+        self.password_entry.insert(0, api_keys['password'])
+        # symbols 입력 필드 업데이트
+        entries = [self.symbol1_entry, self.symbol2_entry, self.symbol3_entry]
+        for entry in entries:
+            symbol = entry.get().strip()
+            if symbol:
+                if selected_exchange == 'binance':
+                    symbol = symbol.replace(':USDT', '')
+                elif selected_exchange in ['okx', 'bybit'] and not symbol.endswith(':USDT'):
+                    symbol = f"{symbol}:USDT"
+                entry.delete(0, tk.END)
+                entry.insert(0, symbol)
 
     def setup_trading_tab(self):
         """거래 설정 탭"""
@@ -1072,7 +988,7 @@ class TradingGUI:
         ttk.Label(trading_frame, text="자본 사용 비율 (%):").grid(row=3, column=0, sticky='w', padx=5, pady=5)
         self.capital_usage_entry = ttk.Entry(trading_frame, width=20)
         self.capital_usage_entry.grid(row=3, column=1, sticky='w', padx=5, pady=5)
-        self.capital_usage_entry.insert(0, "170")
+        self.capital_usage_entry.insert(0, "50")  # 170%에서 50%로 안전하게 조정
         
         ttk.Label(trading_frame, text="손절허용 레벨:").grid(row=4, column=0, sticky='w', padx=5, pady=5)
         self.donchian_level_entry = ttk.Entry(trading_frame, width=20)
@@ -1105,6 +1021,18 @@ class TradingGUI:
         """최초 세팅 방법 표시"""
         setup_text = """
 === 최초 세팅 방법 ===
+1. 거래소 API 키 설정:
+   - OKX, Binance, Bybit의 API 키, 시크릿 키, 패스워드(OKX 전용)를 준비하세요.
+   - 'API 설정' 탭에서 거래소를 선택하고 키를 입력하거나, JSON 설정 파일을 불러오세요.
+2. JSON 설정 파일:
+   - '파일 > 설정 저장'으로 API 키와 거래 설정을 settings.json에 저장.
+   - 예시: {"exchanges": {"okx": {"api_key": "...", "secret_key": "...", "password": "..."}, ...}, "selected_exchange": "OKX", ...}
+   - '파일 > 설정 불러오기'로 저장된 설정을 불러옵니다.
+3. 거래 설정:
+   - 거래 종목(예: XRP/USDT:USDT), 레버리지, 익절 퍼센트, 자본 사용 비율, 손절허용 레벨 입력.
+   - 헷지 모드 필요 시 체크.
+4. 매매 시작:
+   - 설정 완료 후 '매매 시작' 버튼 클릭.
         """
         self.show_text_window("최초 세팅 방법", setup_text)
 
@@ -1112,6 +1040,12 @@ class TradingGUI:
         """사용 설명서 표시"""
         manual_text = """
 === 사용 설명서 ===
+- Donchian 채널 기반 선물 거래 봇.
+- 지원 거래소: OKX, Binance, Bybit (선물 전용).
+- 매매 로직: 상단 채널 돌파 시 매수, 하단 이탈 또는 익절 시 매도.
+- 헷지 모드: 활성화 시 숏 포지션 가능.
+- 설정 저장/불러오기: API 키와 거래 설정을 JSON 파일로 관리.
+- 긴급 정지: 모든 포지션 청산 및 미체결 주문 취소.
         """
         self.show_text_window("사용 설명서", manual_text)
 
@@ -1134,16 +1068,21 @@ class TradingGUI:
             for entry in [self.symbol1_entry, self.symbol2_entry, self.symbol3_entry]:
                 symbol = entry.get().strip()
                 if symbol:
-                    # Binance 선물은 :USDT 제거
                     if self.exchange_var.get().lower() == 'binance':
                         symbol = symbol.replace(':USDT', '')
                     symbols.append(symbol)
             
-            settings = {
-                'exchange': self.exchange_var.get(),
+            # 현재 GUI 입력값으로 API 키 업데이트
+            selected_exchange = self.exchange_var.get().lower()
+            self.api_keys[selected_exchange] = {
                 'api_key': self.api_key_entry.get(),
                 'secret_key': self.secret_key_entry.get(),
-                'password': self.password_entry.get(),
+                'password': self.password_entry.get()
+            }
+            
+            settings = {
+                'exchanges': self.api_keys,
+                'selected_exchange': self.exchange_var.get(),
                 'symbols': symbols,
                 'leverage': int(self.leverage_entry.get()),
                 'take_profit_percent': float(self.take_profit_entry.get()),
@@ -1158,95 +1097,49 @@ class TradingGUI:
             raise Exception(f"설정값 오류: {str(e)}")
 
     def start_trading(self):
-        """매매 시작"""
-        try:
-            settings = self.get_settings_from_gui()
-            
-            # 필수 설정 확인
-            if not all([settings['api_key'], settings['secret_key']]) or \
-               (settings['exchange'].lower() == 'okx' and not settings['password']):
-                messagebox.showerror("설정 오류", "API 키 정보를 모두 입력해주세요.")
-                return
-            
-            if not settings['symbols']:
-                messagebox.showerror("설정 오류", "거래할 종목을 최소 1개 이상 입력해주세요.")
-                return
-            
-            if settings['donchian_activation_level'] < 1 or settings['donchian_activation_level'] > 10:
-                messagebox.showerror("설정 오류", "손절허용 레벨은 1~10 사이의 값이어야 합니다.")
-                return
-            
-            # 거래소 초기화
-            exchange_name = settings['exchange'].lower()
+            """매매 시작"""
             try:
-                if exchange_name == 'okx':
-                    self.trader = ccxt.okx({
-                        'apiKey': settings['api_key'],
-                        'secret': settings['secret_key'],
-                        'password': settings['password'],
-                        'enableRateLimit': True
-                    })
-                    # 선물 거래 설정
-                    self.trader.set_margin_mode('isolated' if settings['hedge_enabled'] else 'cross')
-                elif exchange_name == 'binance':
-                    self.trader = ccxt.binance({
-                        'apiKey': settings['api_key'],
-                        'secret': settings['secret_key'],
-                        'enableRateLimit': True,
-                        'options': {'defaultType': 'future'}  # 선물 거래 활성화
-                    })
-                    # 헷지 모드 설정
-                    self.trader.set_margin_mode('isolated' if settings['hedge_enabled'] else 'cross')
-                elif exchange_name == 'bybit':
-                    self.trader = ccxt.bybit({
-                        'apiKey': settings['api_key'],
-                        'secret': settings['secret_key'],
-                        'enableRateLimit': True,
-                        'options': {'defaultContractType': 'linear'}  # 선형 선물
-                    })
-                    # 헷지 모드 설정
-                    if settings['hedge_enabled']:
-                        self.trader.set_position_mode(True)  # 양방향 모드
-                else:
-                    raise ValueError("지원하지 않는 거래소입니다")
+                settings = self.get_settings_from_gui()
                 
-                self.trader.load_markets()
+                if not all([settings['exchanges'][settings['selected_exchange'].lower()]['api_key'],
+                            settings['exchanges'][settings['selected_exchange'].lower()]['secret_key']]) or \
+                (settings['selected_exchange'].lower() == 'okx' and not settings['exchanges']['okx']['password']):
+                    messagebox.showerror("설정 오류", "API 키 정보를 모두 입력해주세요.")
+                    return
                 
-                # 거래 쌍 및 레버리지 설정
-                for symbol in settings['symbols']:
-                    if symbol not in self.trader.symbols:
-                        raise ValueError(f"유효하지 않은 거래 쌍: {symbol}")
-                    self.trader.set_leverage(settings['leverage'], symbol)
+                if not settings['symbols']:
+                    messagebox.showerror("설정 오류", "거래할 종목을 최소 1개 이상 입력해주세요.")
+                    return
                 
-                self.log_message(f"{exchange_name} 선물 거래소 연결 성공")
+                if settings['donchian_activation_level'] < 1 or settings['donchian_activation_level'] > 10:
+                    messagebox.showerror("설정 오류", "손절허용 레벨은 1~10 사이의 값이어야 합니다.")
+                    return
+                
+                if settings['capital_usage_ratio'] > 300:
+                    messagebox.showwarning("경고", "자본 사용 비율이 300%를 초과합니다. 위험할 수 있습니다.")
+                
+                self.trader = MultiSymbolAutoTrader(settings, self.log_queue)
+                self.trading_thread = threading.Thread(target=self.trader.run, daemon=False)
+                self.trading_thread.start()
+                
+                self.start_btn.config(state='disabled')
+                self.stop_btn.config(state='normal')
+                self.emergency_btn.config(state='normal')
+                self.status_label.config(text="상태: 매매 중")
+                self.log_message("자동매매가 시작되었습니다.")
+                
             except Exception as e:
-                messagebox.showerror("연결 오류", f"거래소 연결 실패: {str(e)}")
-                self.log_message(f"거래소 연결 실패: {str(e)}")
-                return
-
-            # MultiSymbolAutoTrader 초기화 (임시 주석 처리)
-            # self.trader = MultiSymbolAutoTrader(settings, self.log_queue)
-            
-            # 별도 스레드에서 실행
-            self.trading_thread = threading.Thread(target=self.trader.run, daemon=False)
-            self.trading_thread.start()
-            
-            self.start_btn.config(state='disabled')
-            self.stop_btn.config(state='normal')
-            self.emergency_btn.config(state='normal')
-            self.status_label.config(text="상태: 매매 중")
-            
-            self.log_message("자동매매가 시작되었습니다.")
-            
-        except Exception as e:
-            messagebox.showerror("시작 오류", f"매매 시작 중 오류가 발생했습니다:\n{str(e)}")
-            self.log_message(f"매매 시작 오류: {str(e)}")
+                self.log_message(f"매매 시작 오류: {str(e)}")
+                messagebox.showerror("시작 오류", f"매매 시작 중 오류가 발생했습니다:\n{str(e)}")
+                # 오류 후 UI 상태 복구
+                self.start_btn.config(state='normal')
+                self.stop_btn.config(state='disabled')
+                self.emergency_btn.config(state='disabled')
 
     def stop_trading(self):
         """매매 중지"""
         if self.trader:
-            # self.trader.stop()  # MultiSymbolAutoTrader에 구현 필요
-            self.log_message("매매 중지 요청")
+            self.trader.stop()
             
             if self.trading_thread and self.trading_thread.is_alive():
                 self.trading_thread.join(timeout=5)
@@ -1261,9 +1154,8 @@ class TradingGUI:
     def emergency_stop(self):
         """긴급 정지"""
         if self.trader:
-            if messagebox.askyesno("긴급 정지", "모든 미체결 주문을 취소하고 포지션을 청산하며 매매를 중지하시겠습니까?"):
-                # self.trader.emergency_stop()  # MultiSymbolAutoTrader에 구현 필요
-                self.log_message("긴급 정지 요청")
+            if messagebox.askyesno("긴급 정지", "모든 미체결 주문을 취소하고 포지션을 청산하시겠습니까?"):
+                self.trader.emergency_stop()
                 
                 if self.trading_thread and self.trading_thread.is_alive():
                     self.trading_thread.join(timeout=10)
@@ -1297,11 +1189,6 @@ class TradingGUI:
         try:
             settings = self.get_settings_from_gui()
             
-            safe_settings = settings.copy()
-            safe_settings.pop('api_key', None)
-            safe_settings.pop('secret_key', None)
-            safe_settings.pop('password', None)
-            
             filename = filedialog.asksaveasfilename(
                 defaultextension=".json",
                 filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
@@ -1309,7 +1196,7 @@ class TradingGUI:
             
             if filename:
                 with open(filename, 'w', encoding='utf-8') as f:
-                    json.dump(safe_settings, f, indent=2, ensure_ascii=False)
+                    json.dump(settings, f, indent=2, ensure_ascii=False)
                 messagebox.showinfo("저장 완료", "설정이 저장되었습니다.")
                 
         except Exception as e:
@@ -1345,17 +1232,30 @@ class TradingGUI:
     def load_settings_to_gui(self, settings):
         """설정을 GUI에 적용"""
         try:
-            if 'exchange' in settings:
-                self.exchange_var.set(settings['exchange'])
+            # API 키 캐시 업데이트
+            if 'exchanges' in settings:
+                for exchange in ['okx', 'binance', 'bybit']:
+                    if exchange in settings['exchanges']:
+                        self.api_keys[exchange] = settings['exchanges'][exchange]
             
+            # 거래소 선택
+            if 'selected_exchange' in settings:
+                self.exchange_var.set(settings['selected_exchange'])
+            
+            # 거래 설정
             if 'symbols' in settings:
                 symbols = settings['symbols']
                 entries = [self.symbol1_entry, self.symbol2_entry, self.symbol3_entry]
-                
+                selected_exchange = self.exchange_var.get().lower()
                 for i, entry in enumerate(entries):
                     entry.delete(0, tk.END)
                     if i < len(symbols):
-                        entry.insert(0, symbols[i])
+                        symbol = symbols[i]
+                        if selected_exchange == 'binance':
+                            symbol = symbol.replace(':USDT', '')
+                        elif selected_exchange in ['okx', 'bybit'] and not symbol.endswith(':USDT'):
+                            symbol = f"{symbol}:USDT"
+                        entry.insert(0, symbol)
             
             if 'leverage' in settings:
                 self.leverage_entry.delete(0, tk.END)
@@ -1375,7 +1275,10 @@ class TradingGUI:
             
             if 'hedge_enabled' in settings:
                 self.hedge_var.set(settings['hedge_enabled'])
-                
+            
+            # API 키 필드 업데이트
+            self.on_exchange_select(None)
+            
         except Exception as e:
             logger.warning(f"GUI 설정 적용 실패: {str(e)}")
 
