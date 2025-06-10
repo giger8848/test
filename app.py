@@ -358,40 +358,56 @@ class MultiSymbolAutoTrader:
             self.log(f"{symbol} 주문 수량 계산 오류: {str(e)}")
             contracts = position_value / price
             return max(float(round(contracts, 8)), 0.001)
-
-
+        
+    def check_entry_conditions(self, symbol):
+        """진입 조건 확인 및 주문 실행"""
+        try:
+            if self.is_entry_condition_met(symbol):
+                self.log(f"{symbol} 진입 조건 충족 - 롱 진입 시도")
+                # 초기 amount는 정수형 또는 최소 lot_size 기반으로 설정
+                markets = self.exchange.load_markets()
+                if symbol in markets:
+                    market = markets[symbol]
+                    lot_size = float(market['limits']['amount']['min'])
+                else:
+                    lot_size = 0.01
+                initial_amount = int(lot_size * 10)  # 예: 최소 lot_size의 10배로 설정 (조정 가능)
+                self.place_market_order(symbol, "buy", initial_amount)
+        except Exception as e:
+            self.log(f"{symbol} 진입 조건 처리 오류: {str(e)}")
     def place_market_order(self, symbol, side, amount):
         """시장가 주문"""
         try:
             params = {}
             exchange_name = self.settings['selected_exchange'].lower()
             if exchange_name == 'binance':
-                # markets 데이터 로드
                 markets = self.exchange.load_markets()
                 if symbol in markets:
                     market = markets[symbol]
-                    precision = market['precision']['amount']  # 소수점 정밀도
-                    lot_size = float(market['limits']['amount']['min'])  # 최소 주문 수량
+                    precision = market['precision']['amount']
+                    lot_size = float(market['limits']['amount']['min'])
                 else:
-                    precision = 8  # 기본 정밀도
-                    lot_size = 0.01  # 기본 최소 주문 수량
+                    precision = 8
+                    lot_size = 0.01
                 ticker = self.exchange.fetch_ticker(symbol)
                 current_price = ticker['last']
                 min_notional = 5.0
                 required_amount = max(amount, (min_notional / current_price) * 1.1)
-                # 정밀도에 맞게 반올림
                 rounded_amount = round(required_amount, precision)
-                # lot_size 배수로 조정, 정수화
                 multiplier = int(round(rounded_amount / lot_size))
-                adjusted_amount = int(multiplier * lot_size)  # 명시적 정수 변환
+                raw_adjusted = multiplier * lot_size
+                adjusted_amount = int(round(raw_adjusted))  # 명시적 정수 변환
                 if adjusted_amount < int(lot_size):
                     adjusted_amount = int(lot_size)
-                self.log(f"Debug - Symbol: {symbol}, Required: {required_amount}, Rounded: {rounded_amount}, Adjusted: {adjusted_amount}, Lot Size: {lot_size}")
+                self.log(f"Debug - {symbol}: Required: {required_amount}, Rounded: {rounded_amount}, Multiplier: {multiplier}, Raw Adjusted: {raw_adjusted}, Final Adjusted: {adjusted_amount}, Lot Size: {lot_size}")
+                # 타입 강제 확인
+                if not isinstance(adjusted_amount, int):
+                    raise ValueError(f"Amount is not an integer: {adjusted_amount}")
             elif exchange_name == 'bybit':
                 if side == 'buy':
-                    params['posSide'] = 'long'
+                    params['posSide'] = 'Long'
                 elif side == 'sell':
-                    params['posSide'] = 'short'
+                    params['posSide'] = 'Short'
             elif exchange_name == 'okx':
                 params['tdMode'] = 'cross'
                 if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
@@ -405,56 +421,28 @@ class MultiSymbolAutoTrader:
             self.log(f"{symbol} 시장가 주문 오류: {str(e)}")
             return None
 
-    def place_limit_order(self, symbol, side, price, amount, level):
-        """지정가 주문"""
-        try:
-            params = {}
-            exchange_name = self.settings['selected_exchange'].lower()
-            if exchange_name == 'binance':
-                params['reduceOnly'] = False
-            elif exchange_name == 'bybit':
-                if side == 'buy':
-                    params['posSide'] = 'long'
-                elif side == 'sell':
-                    params['posSide'] = 'short'
-            elif exchange_name == 'okx':
-                params['tdMode'] = 'cross'
-                if hasattr(self, 'position_mode') and self.position_mode == 'long_short_mode':
-                    params['posSide'] = 'long' if side == 'buy' else 'short'
-            
-            order = self.exchange.create_limit_order(symbol, side, amount, price, params=params)
-            self.log(f"{symbol} {level}회차 {side} 지정가 주문 실행: 가격 {self.format_price(price)}, 수량 {amount}")
-            return order
-        except Exception as e:
-            self.log(f"{symbol} 지정가 주문 오류: {str(e)}")
-            return None
-
     def generate_followup_orders(self, symbol, side, initial_amount):
-        """시장가 주문 후 후속 지정가 주문 생성 (기존 로직 기반)"""
+        """시장가 주문 후 후속 지정가 주문 생성"""
         try:
             exchange_name = self.settings['selected_exchange'].lower()
-            if exchange_name == 'binance':
+            if exchange_name in ['binance', 'bybit', 'okx']:
+                markets = self.exchange.load_markets()
+                if symbol in markets:
+                    market = markets[symbol]
+                    lot_size = float(market['limits']['amount']['min'])
+                else:
+                    lot_size = 0.01
                 position = self.exchange.fetch_position(symbol)
-                if position and float(position['info']['positionAmt']) != 0:
+                if position and float(position['info'].get('positionAmt', 0)) != 0:
                     base_price = float(self.exchange.fetch_ticker(symbol)['last'])
                     for i in range(1, 6):  # 5회차 후속 주문
-                        price_step = base_price * (1 + 0.01 * i)  # 1%씩 증가
-                        amount_step = initial_amount * 0.2  # 20%씩 분할
+                        price_step = round(base_price * (1 + 0.01 * i), market['precision']['price'])
+                        amount_step = int(round(initial_amount * 0.2 / lot_size) * lot_size)  # 정수화 강화
                         self.place_limit_order(symbol, "sell" if side == "buy" else "buy", price_step, amount_step, i)
                 else:
                     self.log(f"{symbol} 포지션 없음, 후속 주문 생성 실패")
-            elif exchange_name in ['bybit', 'okx']:
-                # 기존 OKX 로직 유지 (포지션 기반 후속 주문)
-                state = self.symbol_states.get(symbol, {})
-                if state.get('position_amount', 0) > 0:
-                    base_price = float(self.exchange.fetch_ticker(symbol)['last'])
-                    for i in range(1, 6):
-                        price_step = base_price * (1 + 0.01 * i)
-                        amount_step = initial_amount * 0.2
-                        self.place_limit_order(symbol, "sell" if side == "buy" else "buy", price_step, amount_step, i)
         except Exception as e:
             self.log(f"{symbol} 후속 주문 생성 오류: {str(e)}")
-
     def place_tp_order(self, symbol, tp_price, amount, tp_type):
         """TP 주문 생성 - 에러 처리 강화"""
         try:
@@ -1234,7 +1222,7 @@ class TradingGUI:
         try:
             # API 키 캐시 업데이트
             if 'exchanges' in settings:
-                for exchange in ['okx', 'binance', 'bybit']:
+                for exchange in ['okx', 'binance', 'bybit','bitget']:
                     if exchange in settings['exchanges']:
                         self.api_keys[exchange] = settings['exchanges'][exchange]
             
